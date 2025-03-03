@@ -17,16 +17,22 @@ locationBias : bias which means results around the specified location can be ret
           explicit location such as Market in Barcelona. In this case, locationBias is
           ignored.
 
+    "locationBias": {
+        "circle": {
+            "center": {"latitude": 37.7937, "longitude": -122.3965},
+            "radius": 500.0
+        }
+    },
+
 regionCode : code used to format the response
 
     https://www.unicode.org/cldr/charts/46/supplemental/territory_language_information.html
-
-
 
 """
 import os
 import re
 import sys
+import json
 import pickle
 import hashlib
 import httplib2
@@ -40,7 +46,17 @@ class SearchPlaces:
     home = os.environ.get('HOME', None)
     CACHE_DIR = os.path.join(home, 'google-places-cache')
     SERVICE_ACCOUNT_FILE = os.path.join(home, 'dealer-db-e412904af5d6.json')
+    TABLE_A = os.path.join(os.path.dirname(__file__), 'data', 'table_a.json')
 
+    class TableA:
+        def __init__(self):
+            self.include_types = set()
+            with open(SearchPlaces.TABLE_A, 'r', encoding='UTF-8') as fh:
+                table = json.load(fh)
+                for category in table:
+                    self.include_types.update(table[category])
+        def contains(self, item):
+            return item in self.include_types
 
     class Cache:
         def __init__(self, key, default=None):
@@ -93,6 +109,32 @@ class SearchPlaces:
                     return data.keys()[-1]
             return data
 
+    class Location:
+        def __init__(self, name, lat, long, radius=500.0):
+            self.name = name
+            self.lat = lat
+            self.long = long
+            self.radius = radius
+            self.id = None
+        def __eq__(self, other):
+            if isinstance(other, self.__class__):
+                return self.lat == other.lat \
+                   and self.long == other.long \
+                   and self.lat == other.radius
+            return False
+        def __hash__(self):
+            return hash((self.lat, self.long, self.radius))
+        def __repr__(self):
+            return f'{self.__class__.__name__}({self.lat}, {self.long}, {self.radius})'
+        def __lt__(self, other):
+            if isinstance(other, self.__class__):
+                return self.name < other.name 
+            return NotImplemented
+        def get_id(self):
+            if self.id is None:
+                key = f'{self.lat},{self.long},{self.radius}'
+                self.id = hashlib.md5(key.encode('utf-8')).hexdigest()
+            return self.id
 
     class Page:
         def __init__(self, token, number):
@@ -122,7 +164,9 @@ class SearchPlaces:
             return super().request(uri, method=method, body=body,
                                         headers=headers, **kwargs)
 
-    def __init__(self, query):
+    def __init__(self, query, location=None):
+        if query is None or len(query) == 0:
+            raise Exception(f'{self.__class__.__name__}(query is required)')
         credentials = service_account.Credentials.from_service_account_file(
             self.SERVICE_ACCOUNT_FILE,
             scopes=['https://www.googleapis.com/auth/cloud-platform']
@@ -130,9 +174,19 @@ class SearchPlaces:
         custom_http = self.CustomHttp()
         authorized_http = google_auth_httplib2.AuthorizedHttp(credentials,
                                                               http=custom_http)
+        table_a = self.TableA()
+        self.included_type = None
+        for token in query.split():
+            if table_a.contains(token):
+                self.included_type = token
+                break
+        if self.included_type is not None:
+            query = ' '.join(token for token in query.split()
+                             if token != self.included_type)
         self.id = None
         self.pages = None
         self.query = query
+        self.location = location
         self.service = build('places', 'v1', http=authorized_http)
 
     def __enter__(self):
@@ -156,6 +210,10 @@ class SearchPlaces:
         """
         if self.id is None:
             query = re.sub(r'\s+', " ", self.query.lower().strip())
+            if self.location is not None:
+                query = f'{query}/{self.location.get_id()}'
+            if self.included_type is not None:
+                query = f'{query}/{self.included_type}'
             self.id = hashlib.md5(query.encode('utf-8')).hexdigest()
         return self.id
 
@@ -190,6 +248,16 @@ class SearchPlaces:
             request_body = {
                 "textQuery": self.query,
             }
+            if self.included_type is not None:
+                request_body['includedType'] = self.included_type
+            if self.location is not None:
+                request_body['locationBias']: {
+                    'circle': {
+                        'center': {'latitude': self.location.lat,
+                                   'longitude': self.location.long},
+                        'radius': self.location.radius
+                    }
+                }
             if page.token is not None:
                 request_body['pageToken'] = page.token
                 print(f'search() requesting pageToken: {page.md5}',
